@@ -442,10 +442,21 @@ class BroDetect {
     return intfInfo && intfInfo.name && (intfInfo.name == "tun_fwvpn" || intfInfo.name.startsWith("wg") || intfInfo.name.startsWith("awg"))
   }
 
-  recordDeviceHeartbeat(mac, ts, ip, fam = 4) {
+  async recordDeviceHeartbeat(mac, ts, ip, fam = 4) {
     // do not record into activeMac if it is earlier than 5 minutes ago, in case the IP address has changed in the last 5 minutes
     if (ts > Date.now() / 1000 - 300) {
       if (sysManager.isLinkLocal(ip, fam)) return; // ignore link local address
+      if (fam == 6) {
+        // an ipv6 prefix can be shared between a LAN (e.g. via ipv6PassthroughFrom) and the WAN
+        // that delegated it, so the mac's captured l2 address alone can't prove it's actually a
+        // neighbor on that LAN -- it may just be a WAN-side peer whose traffic we route through.
+        // Reject here, before it ever enters activeMac, rather than filtering it out later.
+        const intfInfo = sysManager.getInterfaceViaIP6(ip);
+        if (intfInfo && intfInfo.type !== "wan" && !(await l2.isNeighborOnInterface(mac, intfInfo.name))) {
+          log.debug(`Heartbeat: ${mac} is not a real neighbor on ${intfInfo.name}, drop`, ip);
+          return;
+        }
+      }
       let macIPEntry = this.activeMac[mac];
       if (!macIPEntry)
         macIPEntry = { ipv6Addr: [] };
@@ -521,6 +532,7 @@ class BroDetect {
         }
 
         this.recordDeviceHeartbeat(localMac, dnsFlow.ts, dnsFlow.sh, localFam)
+          .catch(err => log.error("Failed to record device heartbeat", localMac, err))
       }
 
       if (!this.isMonitoring(intfInfo, monitorable) || !this.isDNSCacheOn(intfInfo, monitorable)) {
@@ -1181,6 +1193,7 @@ class BroDetect {
         // this should be done before device monitoring check, we still want heartbeat update from unmonitored devices
         if (obj.proto == 'tcp' || flowdir == 'in' && obj.orig_pkts || flowdir == 'out' && obj.resp_pkts)
           this.recordDeviceHeartbeat(localMac, Math.round((obj.ts + obj.duration) * 100) / 100, lhost, fam)
+            .catch(err => log.error("Failed to record device heartbeat", localMac, err))
       }
 
       // for v6 link-local addresses

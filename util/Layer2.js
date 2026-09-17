@@ -137,8 +137,23 @@ function getMAC(ipaddress, cb) {
   });
 }
 
+// IPv6 prefixes can be shared between a LAN (e.g. via ipv6PassthroughFrom) and the WAN
+// segment that delegated them, so a mac's address alone doesn't prove it's actually a
+// neighbor on a given interface -- only the kernel's own neighbor table does. Used to
+// avoid attributing WAN-side peers (whose traffic we merely route/forward) to a LAN.
+async function isNeighborOnInterface(mac, intfName) {
+  if (!mac || !intfName) return false;
+  try {
+    const result = await execFile("ip", ["-6", "neighbor", "show", "dev", intfName]);
+    return result.stdout.toLowerCase().includes(mac.toLowerCase());
+  } catch (err) {
+    return false;
+  }
+}
+
 module.exports = {
   getMAC:getMAC,
   getMACAsync: util.promisify(getMAC),
+  isNeighborOnInterface,
   updatePermanentArpEntries
 }
