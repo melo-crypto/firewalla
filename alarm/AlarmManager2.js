@@ -1841,6 +1841,11 @@ module.exports = class {
     return resolved;
   }
 
+  // the flags of a rule request, from the duplicate status that checkAndSave reports
+  ruleSaveFlags(status) {
+    return { alreadyExists: status === "duplicated", updated: status === "duplicated_and_updated" };
+  }
+
   // FIXME: make it transactional
   // saves the rule and sets the result of the alarm it came from, which stays active for an auto block
   async saveAlarmRule(alarm, p, { result, auto = false }) {
