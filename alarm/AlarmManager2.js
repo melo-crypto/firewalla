@@ -1413,6 +1413,17 @@ module.exports = class {
     return results[0];
   }
 
+  async getValidAlarm(alarmID) {
+    const alarm = await this.getAlarm(alarmID)
+
+    if (!alarm) {
+      log.error("Invalid alarm ID:", alarmID);
+      throw new Error("Invalid alarm ID: " + alarmID);
+    }
+
+    return alarm
+  }
+
   async idsToAlarmsAsync(ids, withDetails = false) {
     if (!Array.isArray(ids)) throw new Error('Non-array ID input')
 
@@ -1611,10 +1622,7 @@ module.exports = class {
     const alarms = await this.findSimilarAlarmsByException(exception);
     for (const alarm of alarms) {
       // not a block or an allow, so resultRefOf leaves it alone
-      alarm.result_exception = exception.eid;
-      alarm.result = "archiveByException";
-      await this.updateAlarm(alarm);
-      await this.archiveAlarm(alarm.aid);
+      await this.resolveAlarm(alarm, { result: 'archiveByException', ref: 'result_exception', refId: exception.eid });
     }
     return alarms;
   }
@@ -1810,20 +1818,39 @@ module.exports = class {
     })
   }
 
-  async blockAlarmByPolicy(alarm, policy, info) {
-    if (!alarm || !policy) {
-      return
-    }
-
-    log.info(`Alarm to block: ${alarm.aid}`)
-
-    setAlarmResult(alarm, 'block', 'result_policy', policy.pid, info && info.method === "auto");
+  // sets the result of an alarm and archives it
+  async resolveAlarm(alarm, { result, ref, refId, auto = false, archive = true }) {
+    setAlarmResult(alarm, result, ref, refId, auto);
 
     await this.updateAlarm(alarm);
 
-    await this.archiveAlarm(alarm.aid);
+    if (archive) await this.archiveAlarm(alarm.aid);
+  }
 
-    log.info(`Alarm ${alarm.aid} is blocked successfully`)
+  // one alarm at a time, so a failure leaves out that alarm only. Returns the alarms that went through
+  async resolveRelatedAlarms(alarms, resolve, by) {
+    const resolved = [];
+    for (const a of alarms) {
+      try {
+        await resolve(a);
+        resolved.push(a);
+      } catch (err) {
+        log.error(`Failed to resolve alarm ${a.aid} with ${by}: ${err}`);
+      }
+    }
+    return resolved;
+  }
+
+  // FIXME: make it transactional
+  // saves the rule and sets the result of the alarm it came from, which stays active for an auto block
+  async saveAlarmRule(alarm, p, { result, auto = false }) {
+    const { policy, alreadyExists } = await pm2.checkAndSaveAsync(p)
+
+    await this.resolveAlarm(alarm, {
+      result, ref: 'result_policy', refId: policy.pid, auto, archive: !(auto || alarm.result_method === "auto")
+    });
+
+    return { policy, alreadyExists }
   }
 
   async findSimilarAlarmsByException(exception, curAlarmID) {
@@ -1845,48 +1872,17 @@ module.exports = class {
     })
   }
 
-  async allowAlarmByException(alarm, exception, info, needArchive) {
-    if (!alarm || !exception) {
-      return
-    }
-
-    log.info(`Alarm to allow: ${alarm.aid}`)
-
-    setAlarmResult(alarm, 'allow', 'result_exception', exception.eid, info.method === "auto");
-
-    await this.updateAlarm(alarm);
-
-    if (needArchive) {
-      await this.archiveAlarm(alarm.aid);
-    } else {
-      await this.removeAlarmAsync(alarm.aid);
-    }
-
-    log.info(`Alarm ${alarm.aid} is allowed successfully`)
-  }
-
   blockFromAlarm(alarmID, info, callback) {
     return util.callbackify(this.blockFromAlarmAsync).bind(this)(alarmID, info, callback || function () { })
   }
 
-  async blockFromAlarmAsync(alarmID, value) {
-    log.info("Going to block alarm " + alarmID);
-    log.info("value: ", value);
-
-    let info = value.info;
-
-    const alarm = await this.getAlarm(alarmID)
-
-    log.info("Alarm to block:", alarm);
-
-    if (!alarm) {
-      log.error("Invalid alarm ID:", alarmID);
-      throw new Error("Invalid alarm ID: " + alarmID);
-    }
+  // the rule an alarm turns into, from the alarm and the info of the request
+  async buildPolicyFromAlarm(alarm, value) {
+    const info = value.info;
 
     let p = {
       alarm_type: alarm.type,
-      aid: alarmID,
+      aid: alarm.aid,
       reason: alarm.type,
     };
 
@@ -2112,30 +2108,33 @@ module.exports = class {
 
     log.info("Policy object:", p);
 
-    // FIXME: make it transactional
-    // set alarm handle result + add policy
-    const { policy, alreadyExists } = await pm2.checkAndSaveAsync(p)
-    setAlarmResult(alarm, 'block', 'result_policy', policy.pid, value.method === "auto");
+    return p;
+  }
 
-    await this.updateAlarm(alarm)
+  async blockFromAlarmAsync(alarmID, value) {
+    log.info("Going to block alarm " + alarmID);
+    log.info("value: ", value);
 
-    if (alarm.result_method != "auto") {
-      // archive alarm unless it's auto block
-      await this.archiveAlarm(alarm.aid)
-    }
+    const info = value.info;
+
+    const alarm = await this.getValidAlarm(alarmID)
+
+    log.info("Alarm to block:", alarm);
+
+    const p = await this.buildPolicyFromAlarm(alarm, value);
+
+    // alarm:block records block even for a rule that allows
+    const { policy, alreadyExists } = await this.saveAlarmRule(alarm, p, { result: 'block', auto: value.method === "auto" });
 
     log.info("Trying to find if any other active alarms are covered by this new policy")
     const alarms = await this.findSimilarAlarmsByPolicy(p)
-    const blockedAlarms = []
-    for (const a of alarms) {
-      if (a.aid == alarm.aid) continue
-      try {
-        await this.blockAlarmByPolicy(a, policy, info)
-        blockedAlarms.push(a)
-      } catch (err) {
-        log.error(`Failed to block alarm ${a.aid} with policy ${policy.pid}: ${err}`)
-      }
-    }
+    const blockedAlarms = await this.resolveRelatedAlarms(alarms.filter(a => a.aid != alarm.aid), async a => {
+      log.info(`Alarm to block: ${a.aid}`)
+      await this.resolveAlarm(a, {
+        result: 'block', ref: 'result_policy', refId: policy.pid, auto: info && info.method === "auto"
+      });
+      log.info(`Alarm ${a.aid} is blocked successfully`)
+    }, `policy ${policy.pid}`)
     return { policy, blockedAlarms, alreadyExists }
   }
 
@@ -2144,14 +2143,9 @@ module.exports = class {
 
     let userInput = info.info;
 
-    const alarm = await this.getAlarm(alarmID)
+    const alarm = await this.getValidAlarm(alarmID)
 
     log.info("Alarm to allow: ", alarm);
-
-    if (!alarm) {
-      log.error("Invalid alarm ID:", alarmID);
-      throw new Error("Invalid alarm ID: " + alarmID)
-    }
 
     const e = await this.createException(alarm, userInput);
 
@@ -2160,22 +2154,17 @@ module.exports = class {
 
     const { exception, alreadyExists } = await exceptionManager.checkAndSave(e)
 
-    setAlarmResult(alarm, 'allow', 'result_exception', exception.eid, false);
-
-    await this.updateAlarm(alarm)
-    await this.archiveAlarm(alarm.aid)
+    await this.resolveAlarm(alarm, { result: 'allow', ref: 'result_exception', refId: exception.eid });
     log.info("Trying to find if any other active alarms are covered by this new exception")
     let alarms = await this.findSimilarAlarmsByException(exception, alarm.aid)
     if (alarms && alarms.length > 0) {
-      let allowedAlarms = []
-      for (const alarm of alarms) {
-        try {
-          await this.allowAlarmByException(alarm, exception, info, true);
-          allowedAlarms.push(alarm)
-        } catch (err) {
-          log.error(`Failed to allow alarm ${alarm.aid} with exception ${exception.eid}: ${err}`)
-        }
-      }
+      const allowedAlarms = await this.resolveRelatedAlarms(alarms, async a => {
+        log.info(`Alarm to allow: ${a.aid}`)
+        await this.resolveAlarm(a, {
+          result: 'allow', ref: 'result_exception', refId: exception.eid, auto: info.method === "auto"
+        });
+        log.info(`Alarm ${a.aid} is allowed successfully`)
+      }, `exception ${exception.eid}`)
       return { exception, allowedAlarms, alreadyExists }
     } else {
       log.info("No similar alarms are found")
@@ -2209,12 +2198,7 @@ module.exports = class {
 
   // pickRef: which pointer of the alarm to follow
   async unhandleAlarm(alarmID, pickRef) {
-    const alarm = await this.getAlarm(alarmID)
-
-    if (!alarm) {
-      log.error("Invalid alarm ID:", alarmID);
-      throw new Error("Invalid alarm ID: " + alarmID);
-    }
+    const alarm = await this.getValidAlarm(alarmID)
 
     const ref = pickRef(alarm);
 
