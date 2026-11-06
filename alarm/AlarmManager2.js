@@ -1865,13 +1865,13 @@ module.exports = class {
 
   // FIXME: make it transactional
   // saves the rule and sets the result of the alarm it came from, which stays active for an auto block.
-  // The result is the action of the saved rule unless the caller names one
-  async saveAlarmRule(alarm, p, { result, auto = false } = {}) {
+  // The result is the action of the saved rule unless the caller names one.
+  // archive: alarm:block leaves an alarm that is, or was, auto blocked active
+  async saveAlarmRule(alarm, p, { result, auto = false, archive = !(auto || alarm.result_method === "auto") } = {}) {
     const { policy, alreadyExists } = await pm2.checkAndSaveAsync(p)
 
     await this.resolveAlarm(alarm, {
-      result: result || policy.action, ref: 'result_policy', refId: policy.pid, auto,
-      archive: !(auto || alarm.result_method === "auto")
+      result: result || policy.action, ref: 'result_policy', refId: policy.pid, auto, archive
     });
 
     return { policy, alreadyExists }
@@ -2232,7 +2232,8 @@ module.exports = class {
     const p = await this.buildPolicyFromAlarm(alarm, value);
     this.checkAlarmRule(alarm, p, info);
 
-    const { policy, alreadyExists } = await this.saveAlarmRule(alarm, p);
+    // the user decided on this alarm, so it is archived even when an auto block left it active
+    const { policy, alreadyExists } = await this.saveAlarmRule(alarm, p, { archive: true });
 
     log.info("Trying to find if any other active alarms are covered by this new policy")
     // from the saved rule, a duplicate returns the one in place. The exception is only a matcher and is not saved
