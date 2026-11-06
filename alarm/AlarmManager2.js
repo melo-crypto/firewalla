@@ -116,6 +116,12 @@ if redis.call('HGET', KEYS[1], ARGV[1]) == ARGV[2] and redis.call('HGET', KEYS[1
 end
 return 0`;
 
+// HDEL and HMSET in one step. ARGV: how many fields to delete, those fields, then the field/value pairs
+const WRITE_ALARM_LUA = `
+local n = tonumber(ARGV[1])
+redis.call('HDEL', KEYS[1], unpack(ARGV, 2, n + 1))
+return redis.call('HMSET', KEYS[1], unpack(ARGV, n + 2))`;
+
 function setAlarmResult(alarm, result, ref, refId, auto) {
   alarm[ref] = refId;
   alarm.result = result;
@@ -700,12 +706,17 @@ module.exports = class {
     callback(null, this.jsonToAlarm(json));
   }
 
-  async updateAlarm(alarm) {
+  // dropFields: removed in the same atomic write, since HMSET never removes a field
+  async updateAlarm(alarm, dropFields = []) {
     if (!alarm instanceof Alarm.Alarm) alarm = this.jsonToAlarm(alarm)
     if (!alarm) throw new Error('Failed to create Alarm object')
 
     const alarmKey = alarmPrefix + alarm.aid;
-    await rclient.hmsetAsync(alarmKey, alarm.redisfy())
+    if (dropFields.length) {
+      await rclient.evalAsync(WRITE_ALARM_LUA, 1, alarmKey, dropFields.length, ...dropFields, ..._.flatten(Object.entries(alarm.redisfy())))
+    } else {
+      await rclient.hmsetAsync(alarmKey, alarm.redisfy())
+    }
     pclient.publishAsync("alarm:updateCache", JSON.stringify({aid:alarm.aid}));
     return alarm
   }
@@ -1821,16 +1832,14 @@ module.exports = class {
 
   // sets the result of an alarm and archives it
   async resolveAlarm(alarm, { result, ref, refId, auto = false, archive = true }) {
-    // the other pointer would still be there next to the new one, and the readers pick one of them
-    const others = Object.keys(RESULT_REFS).filter(r => r !== ref && alarm[r]);
+    // every other pointer goes in the same atomic write: a concurrent resolve may have set one since this
+    // alarm was read, and the readers pick one of the pointers, so a leftover would stand next to the wrong result
+    const others = Object.keys(RESULT_REFS).filter(r => r !== ref);
     others.forEach(r => delete alarm[r]);
 
     setAlarmResult(alarm, result, ref, refId, auto);
 
-    await this.updateAlarm(alarm);
-
-    // HMSET never removes a field
-    if (others.length) await rclient.hdelAsync(alarmPrefix + alarm.aid, others);
+    await this.updateAlarm(alarm, others);
 
     if (archive) await this.archiveAlarm(alarm.aid);
   }
